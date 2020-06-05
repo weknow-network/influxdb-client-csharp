@@ -50,6 +50,11 @@ namespace InfluxDB.Client
 
 
 
+            WriteApiRxStrategy(service, writeOptions);
+        }
+
+        private void WriteApiRxStrategy(WriteService service, WriteOptions writeOptions)
+        {
             IObservable<IObservable<BatchWriteRecord>> batches = _subject
                 //
                 // Batching
@@ -114,7 +119,7 @@ namespace InfluxDB.Client
                     });
             }
             var query = batches
-                .Concat() 
+                .Concat()
                 //
                 // Map to Async request
                 //
