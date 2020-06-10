@@ -1,3 +1,5 @@
+#define CHANNEL
+
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -8,6 +10,8 @@ using System.Reactive.Subjects;
 using System.Reactive.Threading.Tasks;
 using System.Text;
 using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
 using InfluxDB.Client.Api.Domain;
 using InfluxDB.Client.Api.Service;
 using InfluxDB.Client.Core;
@@ -30,7 +34,11 @@ namespace InfluxDB.Client
         private static readonly ObjectPoolProvider _objectPoolProvider = new DefaultObjectPoolProvider();
         private static readonly ObjectPool<StringBuilder> _stringBuilderPool = _objectPoolProvider.CreateStringBuilderPool();
 
-
+#if CHANNEL
+        private readonly Channel<BatchWriteRecord> _channel;
+        private readonly Task _batchChanellingCompletion;
+        private readonly CancellationTokenSource _channelCancellation = new CancellationTokenSource();
+#endif 
         private bool _disposed;
         protected internal WriteApi(InfluxDBClientOptions options, WriteService service, WriteOptions writeOptions,
             InfluxDBClient influxDbClient)
@@ -42,6 +50,18 @@ namespace InfluxDB.Client
             _options = options;
             _influxDbClient = influxDbClient;
 
+#if CHANNEL
+            var channelOptions = new UnboundedChannelOptions
+            {
+                SingleReader = true,
+                SingleWriter = false
+            };
+            _channel = Channel.CreateUnbounded<BatchWriteRecord>(channelOptions);
+
+
+            _batchChanellingCompletion = BatchChanelling(service, writeOptions);
+#endif
+
             // backpreasure - is not implemented in C#
             // 
             // => use unbound buffer
@@ -49,63 +69,108 @@ namespace InfluxDB.Client
             // https://github.com/dotnet/reactive/issues/19
 
 
-
+#if CHANNEL
+            WriteApiChannelStrategy(service, writeOptions);
+#else
             WriteApiRxStrategy(service, writeOptions);
+#endif
+        }
+
+        private async Task BatchChanelling(
+                                WriteService service,
+                                WriteOptions writeOptions)
+        {
+            while (!_channel.Reader.Completion.IsCompleted)
+            {
+                var batchWriteItem = await _channel.Reader.ReadAsync(_channelCancellation.Token);
+
+                var org = batchWriteItem.Options.OrganizationId;
+                var bucket = batchWriteItem.Options.Bucket;
+                var lineProtocol = batchWriteItem.ToLineProtocol();
+                var precision = batchWriteItem.Options.Precision;
+
+                try
+                {
+                    var retry = false;
+                    do
+                    {
+                        try
+                        {
+                            var restResponse = await service.PostWriteAsyncWithIRestResponse(org, bucket,
+                                 Encoding.UTF8.GetBytes(lineProtocol),
+                                 null,
+                                 "identity",
+                                 "text/plain; charset=utf-8", null,
+                                 "application/json",
+                                 null,
+                                 precision);
+                        }
+                        catch (HttpException httpException)
+                            when (httpException.Status == 429 || httpException.Status == 503)
+                        {
+                            var retryInterval = (httpException.RetryAfter * 1000 ?? writeOptions.RetryInterval) +
+                                                JitterDelay(writeOptions);
+
+                            var retryable = new WriteRetriableErrorEvent(org, bucket, precision, lineProtocol,
+                                httpException, retryInterval);
+                            Publish(retryable);
+
+                            await Task.Delay(retryInterval);
+                        }
+                    } while (retry);
+
+                    var success = new WriteSuccessEvent(org, bucket, precision, lineProtocol);
+                    Publish(success);
+                    Trace.WriteLine($"The batch item: {batchWriteItem} was processed successfully.");
+                }
+                catch (Exception ex)
+                {
+                    var error = new WriteErrorEvent(org, bucket, precision, lineProtocol, ex);
+                    Publish(error);
+
+                    Trace.WriteLine(
+                        $"The batch item wasn't processed successfully because: {ex}");
+                }
+            }
+            Trace.WriteLine($"The batch item: was processed");
+        }
+
+
+        private IObservable<IGroupedObservable<BatchWriteOptions, BatchWriteData>> GroupByTimeAndCount(WriteOptions writeOptions)
+        {
+            var groups = _subject
+                 //
+                 // Batching
+                 //
+                 .Publish(connectedSource =>
+                 {
+                     var trigger = Observable.Merge(
+                             // triggered by time & count
+                             connectedSource.Window(TimeSpan.FromMilliseconds(
+                                                 writeOptions.FlushInterval),
+                                                 writeOptions.BatchSize,
+                                                 writeOptions.WriteScheduler),
+                             // flush trigger
+                             _flush
+                         );
+                     return connectedSource
+                         .Window(trigger);
+                 })
+                 //
+                 // Group by key - same bucket, same org
+                 //
+                 .SelectMany(it => it.GroupBy(batchWrite => batchWrite.Options));
+            return groups;
         }
 
         private void WriteApiRxStrategy(WriteService service, WriteOptions writeOptions)
         {
-            IObservable<IObservable<BatchWriteRecord>> batches = _subject
-                //
-                // Batching
-                //
-                .Publish(connectedSource =>
-                {
-                    var trigger = Observable.Merge(
-                            // triggered by time & count
-                            connectedSource.Window(TimeSpan.FromMilliseconds(
-                                                writeOptions.FlushInterval),
-                                                writeOptions.BatchSize,
-                                                writeOptions.WriteScheduler),
-                            // flush trigger
-                            _flush
-                        );
-                    return connectedSource
-                        .Window(trigger);
-                })
-                //
-                // Group by key - same bucket, same org
-                //
-                .SelectMany(it => it.GroupBy(batchWrite => batchWrite.Options))
+            var groups = GroupByTimeAndCount(writeOptions);
+            var batches = groups
                 //
                 // Create Write Point = bucket, org, ... + data
                 //
-                .Select(grouped =>
-                {
-                    var aggregate = grouped
-                        .Aggregate(_stringBuilderPool.Get(), (builder, batchWrite) =>
-                        {
-                            var data = batchWrite.ToLineProtocol();
-
-                            if (string.IsNullOrEmpty(data)) return builder;
-
-                            if (builder.Length > 0)
-                            {
-                                builder.Append("\n");
-                            }
-
-                            return builder.Append(data);
-                        }).Select(builder =>
-                        {
-                            var result = builder.ToString();
-                            builder.Clear();
-                            _stringBuilderPool.Return(builder);
-                            return result;
-                        });
-
-                    return aggregate.Select(records => new BatchWriteRecord(grouped.Key, records))
-                                    .Where(batchWriteItem => !string.IsNullOrEmpty(batchWriteItem.ToLineProtocol()));
-                });
+                .Select(grouped => BatchAggregation(grouped));
 
             if (writeOptions.JitterInterval > 0)
             {
@@ -210,8 +275,50 @@ namespace InfluxDB.Client
                     });
         }
 
+        private void WriteApiChannelStrategy(WriteService service, WriteOptions writeOptions)
+        {
+            var groups = GroupByTimeAndCount(writeOptions);
+            var batches = groups
+                //
+                // Create Write Point = bucket, org, ... + data
+                //
+                .SelectMany(grouped => BatchAggregation(grouped))
+                .Finally(() => _disposed = true)
+                .Subscribe(batch => _channel.Writer.TryWrite(batch),
+                           ex => { },
+                           () => _channel.Writer.TryComplete());
+        }
+
+        private static IObservable<BatchWriteRecord> BatchAggregation(IGroupedObservable<BatchWriteOptions, BatchWriteData> grouped)
+        {
+            return grouped
+                                    .Aggregate(_stringBuilderPool.Get(), (builder, batchWrite) =>
+                                    {
+                                        var data = batchWrite.ToLineProtocol();
+
+                                        if (string.IsNullOrEmpty(data)) return builder;
+
+                                        if (builder.Length > 0)
+                                        {
+                                            builder.Append("\n");
+                                        }
+
+                                        return builder.Append(data);
+                                    })
+                                    .Where(builder => builder.Length != 0)
+                                    .Select(builder =>
+                                    {
+                                        var records = builder.ToString();
+                                        builder.Clear();
+                                        _stringBuilderPool.Return(builder);
+                                        var result = new BatchWriteRecord(grouped.Key, records);
+                                        return result;
+                                    });
+        }
+
         public void Dispose()
         {
+            _channelCancellation.Cancel();
             _influxDbClient.Apis.Remove(this);
 
             Trace.WriteLine("Flushing batches before shutdown.");
@@ -512,7 +619,7 @@ namespace InfluxDB.Client
 
         private int JitterDelay(WriteOptions writeOptions)
         {
-            return (int) (new Random().NextDouble() * writeOptions.JitterInterval);
+            return (int)(new Random().NextDouble() * writeOptions.JitterInterval);
         }
 
         private void Publish(InfluxDBEventArgs eventArgs)
@@ -634,7 +741,7 @@ namespace InfluxDB.Client
             if (ReferenceEquals(null, obj)) return false;
             if (ReferenceEquals(this, obj)) return true;
             if (obj.GetType() != GetType()) return false;
-            return Equals((BatchWriteOptions) obj);
+            return Equals((BatchWriteOptions)obj);
         }
 
         public override int GetHashCode()
@@ -643,7 +750,7 @@ namespace InfluxDB.Client
             {
                 var hashCode = Bucket != null ? Bucket.GetHashCode() : 0;
                 hashCode = (hashCode * 397) ^ (OrganizationId != null ? OrganizationId.GetHashCode() : 0);
-                hashCode = (hashCode * 397) ^ (int) Precision;
+                hashCode = (hashCode * 397) ^ (int)Precision;
                 return hashCode;
             }
         }
